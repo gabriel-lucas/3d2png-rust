@@ -1,0 +1,795 @@
+use anyhow::{Context, Result};
+use clap::Parser;
+use gltf::{image::Source};
+use image::{load_from_memory, GenericImageView, ImageBuffer, Rgba};
+use image::io::Reader as ImageReader;
+use std::{path::{Path, PathBuf}, sync::Arc};
+use wgpu::{
+    Backends, Buffer, CommandEncoderDescriptor, Device, Extent3d, Instance, 
+    LoadOp, Operations, Queue, RenderPassColorAttachment, RenderPassDescriptor, 
+    RenderPipeline, RequestAdapterOptions, SurfaceConfiguration, Texture, 
+    TextureFormat, TextureUsages,BindGroup, BufferUsages,
+    StoreOp, TextureDescriptor, TextureDimension, TexelCopyBufferLayout,
+};
+use futures::channel::oneshot;
+use wgpu::util::DeviceExt; // For BufferInitDescriptor
+
+#[allow(unused_imports)]
+use bytemuck::{Pod, Zeroable};
+
+#[derive(Parser, Debug)]
+#[clap(author, version, about)]
+struct Args {
+    #[arg(short, long, default_value="models/Avocado.glb")]
+    model: PathBuf,
+    #[arg(short, long, default_value = "output.png")]
+    output: PathBuf,
+    #[arg(short='W', long, default_value_t = 800)]
+    width: u32,
+    #[arg(short='H', long, default_value_t = 600)]
+    height: u32,
+}
+
+struct RenderContext {
+    device: Arc<Device>,
+    queue: Arc<Queue>,
+    config: SurfaceConfiguration,
+    camera_buffer: Buffer,
+    camera_bind_group: BindGroup,
+    camera_bind_group_layout: wgpu::BindGroupLayout,
+    depth_view: wgpu::TextureView,
+}
+
+struct Model {
+    meshes: Vec<Mesh>,
+    materials: Vec<Material>,
+}
+
+struct Mesh {
+    vertex_buffer: Buffer,
+    index_buffer: Buffer,
+    index_count: u32,
+    material_index: usize,
+}
+
+struct Material {
+    bind_group: BindGroup,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+}
+
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    uv: [f32; 2],
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    let render_context = initialize_wgpu(args.width, args.height).await?;
+    let model = load_gltf(&render_context, &args.model).await?;
+    let material_bind_group_layout = create_material_bind_group_layout(&render_context.device);
+    let pipeline = create_render_pipeline(
+        &render_context.device,
+        &render_context.camera_bind_group_layout,
+        &material_bind_group_layout,
+    );
+    let pixels = render_frame(&render_context, &model, &pipeline).await?;
+    save_image(&args.output, pixels, args.width, args.height)?;
+    Ok(())
+}
+
+async fn initialize_wgpu(width: u32, height: u32) -> Result<RenderContext> {
+    let instance = Instance::new(&wgpu::InstanceDescriptor {
+        backends: Backends::all(),
+        flags: wgpu::InstanceFlags::empty(),
+        backend_options: wgpu::BackendOptions {
+            dx12: wgpu::Dx12BackendOptions {
+                shader_compiler: wgpu::Dx12Compiler::default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    });
+
+    let adapter = instance
+        .request_adapter(&RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+        })
+        .await
+        .context("Failed to find suitable GPU adapter")?;
+
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: None,
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+            },
+            None,
+        )
+        .await
+        .context("Failed to create GPU device")?;
+
+    let config = wgpu::SurfaceConfiguration {
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        format: TextureFormat::Rgba8UnormSrgb,
+        width,
+        height,
+        present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode: wgpu::CompositeAlphaMode::Auto,
+        view_formats: vec![],
+        desired_maximum_frame_latency: 2,
+    };
+
+    let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Camera Buffer"),
+        size: std::mem::size_of::<CameraUniform>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+        label: Some("camera_bind_group_layout"),
+    });
+
+    let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &camera_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: camera_buffer.as_entire_binding(),
+        }],
+        label: Some("camera_bind_group"),
+    });
+
+    let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Depth Texture"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth24Plus,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+
+    let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    Ok(RenderContext {
+        device: Arc::new(device),
+        queue: Arc::new(queue),
+        config,
+        camera_buffer,
+        camera_bind_group,
+        camera_bind_group_layout,
+        depth_view,
+    })
+}
+
+async fn load_gltf(context: &RenderContext, path: &PathBuf) -> Result<Model> {
+    let (gltf, imported_buffers, _imported_images) = gltf::import(path)?;
+    let mut materials = Vec::new();
+    let mut textures = Vec::new();
+
+    let base_dir = path.parent().unwrap_or(Path::new("."));
+
+    for image in gltf.images() {
+        match image.source() {
+            Source::Uri { uri, .. } => {
+                let texture_path = base_dir.join(uri);
+                let texture = load_texture(context, &texture_path).await?;
+                textures.push(texture);
+            }
+            //Source::Buffer => {
+            //    let texture = load_embedded_texture(context, &image)?;
+            //    textures.push(texture);
+            //}
+
+            Source::View { view, .. } => {
+                let buffer = view.buffer();
+                let buffer_data = get_buffer_data(&buffer, base_dir,Some(&imported_buffers[..]))?;
+                let offset = view.offset();
+                let length = view.length();
+                let image_data = &buffer_data[offset..offset + length];
+                // Decode the image from the embedded data.
+                let img = load_from_memory(image_data)
+                    .context("Failed to decode embedded texture image")?;
+                let rgba = img.to_rgba8();
+                textures.push(create_texture_from_image(context, &rgba, img.dimensions())?);
+            }
+        }
+    }
+
+    for material in gltf.materials() {
+        let bind_group = create_material_bind_group(context, &material, &textures)?;
+        materials.push(Material { bind_group });
+    }
+
+    let mut meshes = Vec::new();
+    for mesh in gltf.meshes() {
+        let primitive = mesh.primitives().next().context("No primitives in mesh")?;
+        let (vertex_buffer, index_buffer, index_count) = load_mesh(context, &primitive, &imported_buffers)?;
+        
+        meshes.push(Mesh {
+            vertex_buffer,
+            index_buffer,
+            index_count,
+            material_index: primitive.material().index().unwrap_or(0),
+        });
+    }
+
+    Ok(Model { meshes, materials })
+}
+
+fn create_texture_from_image(
+    context: &RenderContext,
+    rgba: &[u8],
+    (width, height): (u32, u32),
+) -> Result<Texture> {
+    let size = Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+
+    let texture = context.device.create_texture(&TextureDescriptor {
+        label: Some("Texture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8UnormSrgb,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    context.queue.write_texture(
+        texture.as_image_copy(),
+        rgba,
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        size,
+    );
+    Ok(texture)
+}
+
+async fn render_frame(
+    context: &RenderContext,
+    model: &Model,
+    pipeline: &RenderPipeline,
+) -> Result<Vec<u8>> {
+    
+    let rotation_angle_deg : f32 =135.0; // Change this value to rotate
+    let rotation_angle = rotation_angle_deg.to_radians();
+    let camera_distance = 2.0; // Distance from object
+
+    // Calculate camera position using polar coordinates
+    let camera_pos = cgmath::Point3::new(
+        rotation_angle.sin() * camera_distance,
+        0.5,  // Fixed height
+        rotation_angle.cos() * camera_distance
+    );
+
+    // Update camera matrix
+    let aspect_ratio = context.config.width as f32 / context.config.height as f32;
+    let view_proj = cgmath::perspective(cgmath::Deg(45.0), aspect_ratio, 0.1, 100.0)
+        * cgmath::Matrix4::look_at_rh(
+            camera_pos,
+            cgmath::Point3::new(0.0, 0.5, 0.0),   // Looking at origin
+            cgmath::Vector3::new(0.0, 1.0, 0.0), // Up vector
+        )
+        * cgmath::Matrix4::from_scale(15.0);
+    
+    
+    let view_proj_uniform = CameraUniform {
+        view_proj: view_proj.into(),
+    };
+    context.queue.write_buffer(
+        &context.camera_buffer,
+        0,
+        bytemuck::cast_slice(&[view_proj_uniform]),
+    );
+    
+    let texture = context.device.create_texture(&TextureDescriptor {
+        label: None,
+        size: Extent3d {
+            width: context.config.width,
+            height: context.config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8UnormSrgb,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+
+    let view = texture.create_view(&Default::default());
+    
+    let mut encoder = context.device.create_command_encoder(&CommandEncoderDescriptor::default());
+    
+    {
+        let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Render Pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(wgpu::Color::BLACK),
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &context.depth_view, 
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+
+        // Set camera bind group
+        render_pass.set_bind_group(0, &context.camera_bind_group, &[]);
+
+        render_pass.set_pipeline(pipeline);
+        
+        for mesh in &model.meshes {
+            render_pass.set_bind_group(1, &model.materials[mesh.material_index].bind_group, &[]);
+            render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+    }
+
+    let bytes_per_row = align_to(4 * context.config.width, 256);
+    let buffer_size = (bytes_per_row * context.config.height) as u64;
+
+    let buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: buffer_size,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(context.config.height),
+            },
+        },
+        Extent3d {
+            width: context.config.width,
+            height: context.config.height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    context.queue.submit(Some(encoder.finish()));
+    
+    let slice = buffer.slice(..);
+    let (sender, receiver) = oneshot::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    
+    context.device.poll(wgpu::Maintain::Wait);
+    receiver.await??;
+    
+    let data = slice.get_mapped_range();
+    let mut pixels = Vec::with_capacity((context.config.width * context.config.height * 4) as usize);
+    let aligned_bytes_per_row = align_to(4 * context.config.width, 256) as usize;
+    let actual_bytes_per_row = (4 * context.config.width) as usize;
+
+    for y in 0..context.config.height {
+        let y = y as usize;
+        let row_start = (y * aligned_bytes_per_row) as usize;
+        let row_end = row_start + actual_bytes_per_row;
+        pixels.extend_from_slice(&data[row_start..row_end]);
+    }
+
+
+    drop(data);
+    buffer.unmap();
+
+    Ok(pixels)
+}
+
+
+fn save_image(path: &PathBuf, pixels: Vec<u8>, width: u32, height: u32) -> Result<()> {
+    ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, pixels)
+        .context("Invalid image dimensions")?
+        .save(path)
+        .context("Failed to save image")
+}
+
+
+/// Load a texture from a URI-based source.
+/// This function reads the image file from disk (using the given `uri`)
+/// relative to the glTF file’s directory, decodes it, and uploads it to GPU.
+async fn load_texture(context: &RenderContext, uri: &Path) -> Result<Texture> {
+    // Read the file into memory.
+    //let data = std::fs::read(uri).with_context(|| format!("Failed to read texture file: {}", uri.display()))?;
+    
+    let img = ImageReader::open(uri)?.decode()?;
+    //let img = load_from_memory(&data).context("Failed to decode texture image");
+    // Decode the image data.
+    //let img = load_from_memory(&data).context("Failed to decode texture image")?;
+    let rgba = img.to_rgba8();
+    let (width, height) = img.dimensions();
+    let size = Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+
+    // Create the GPU texture.
+    let texture = context.device.create_texture(&TextureDescriptor {
+        label: Some(&format!("Texture: {}", uri.display())),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8UnormSrgb,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    // Upload the texture data.
+    context.queue.write_texture(
+        texture.as_image_copy(),
+        &rgba,
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        size,
+    );
+    Ok(texture)
+}
+
+/// Load an embedded texture from a buffer view.
+/// This function uses the information from the glTF image's Source::View variant:
+/// it gets the buffer via `View::buffer()` (see [docs](https://docs.rs/gltf/latest/gltf/buffer/struct.View.html#method.buffer)),
+/// then extracts the sub-slice corresponding to the image (using the view’s offset and length),
+/// decodes it, and creates a GPU texture.
+#[allow(dead_code)]
+fn load_embedded_texture(
+    context: &RenderContext,
+    image: &gltf::image::Image,
+    base_path: &Path,
+) -> Result<Texture> {
+    match image.source() {
+        Source::View { view, mime_type: _ } => {
+            // Get the buffer associated with the view.
+            let buffer = view.buffer();
+            // Load the entire buffer data.
+            let buffer_data = get_buffer_data(&buffer, base_path, None)?;
+            // Slice out the image data using the view's offset and length.
+            let offset = view.offset();
+            let length = view.length();
+            let image_data = &buffer_data[offset..offset + length];
+            // Decode the image.
+            let img = load_from_memory(image_data)
+                .context("Failed to decode embedded texture image")?;
+            let rgba = img.to_rgba8();
+            let (width, height) = img.dimensions();
+            let size = Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            };
+
+            let texture = context.device.create_texture(&TextureDescriptor {
+                label: Some("Embedded Texture"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8UnormSrgb,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            context.queue.write_texture(
+                texture.as_image_copy(),
+                &rgba,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width),
+                    rows_per_image: Some(height),
+                },
+                size,
+            );
+            Ok(texture)
+        }
+        _ => {
+            anyhow::bail!("Image source is not embedded")
+        }
+    }
+}
+
+/// Creates a simple render pipeline using an inline WGSL shader.
+/// Make sure to have a file named `shader.wgsl` in your project directory.
+fn create_render_pipeline(
+    device: &Device,
+    camera_bind_group_layout: &wgpu::BindGroupLayout,
+    material_bind_group_layout: &wgpu::BindGroupLayout,
+) -> RenderPipeline {
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Simple Shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Pipeline Layout"),
+        bind_group_layouts:  &[camera_bind_group_layout, material_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Render Pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        offset: 0,
+                    shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x3,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32x2,
+                    },
+                ],
+            }],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: TextureFormat::Rgba8UnormSrgb,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24Plus,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList, // Add this line
+            ..Default::default()
+        },
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: Default::default(),
+    })
+}
+
+fn create_material_bind_group(
+    context: &RenderContext,
+    material: &gltf::Material,
+    textures: &[Texture],
+) -> Result<BindGroup> {
+    let texture = &textures[material.index().unwrap_or(0)];
+    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    
+    let sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("Material Sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
+    let bind_group_layout = context.device.create_bind_group_layout(
+        &wgpu::BindGroupLayoutDescriptor {
+            label: Some("Material Bind Group Layout"),
+            entries: &[
+                // Texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                // Sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        },
+    );
+
+    let bind_group = context.device.create_bind_group(
+        &wgpu::BindGroupDescriptor {
+            label: Some("Material Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        },
+    );
+
+    Ok(bind_group)
+}
+
+fn create_material_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Material Bind Group Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+
+fn load_mesh(
+    context: &RenderContext,
+    primitive: &gltf::Primitive,
+    imported_buffers: &[gltf::buffer::Data],
+) -> Result<(Buffer, Buffer, u32)> {
+    let reader = primitive.reader(|buffer| Some(&imported_buffers[buffer.index()].0));
+
+    // Get vertex positions
+    let positions: Vec<[f32; 3]> = reader
+        .read_positions()
+        .context("No positions in mesh")?
+        .collect();
+
+    // Get vertex texture coordinates (UVs)
+    let tex_coords: Vec<[f32; 2]> = reader
+        .read_tex_coords(0)
+        .context("No UVs in mesh")?
+        .into_f32()
+        .collect();
+
+    // Get indices
+    let indices = reader
+        .read_indices()
+        .context("No indices in mesh")?
+        .into_u32()
+        .collect::<Vec<_>>();
+
+    // Create vertex buffer with interleaved position and UV data
+
+    let vertices: Vec<Vertex> = positions
+        .into_iter()
+        .zip(tex_coords)
+        .map(|(position, uv)| Vertex { position, uv })
+        .collect();
+
+    let vertex_buffer = context.device.create_buffer_init(
+        &wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        },
+    );
+
+    let index_buffer = context.device.create_buffer_init(
+        &wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        },
+    );
+
+    Ok((vertex_buffer, index_buffer, indices.len() as u32))
+}
+
+
+/// Helper function to load the data for a glTF buffer.
+/// This function reads the file for the buffer based on its source URI.
+/// (See [gltf::buffer::Source](https://docs.rs/gltf/latest/gltf/buffer/enum.Source.html))
+fn get_buffer_data(
+    buffer: &gltf::buffer::Buffer,
+    base_path: &Path,
+    imported_buffers: Option<&[gltf::buffer::Data]>
+) -> Result<Vec<u8>> {
+    match buffer.source() {
+        gltf::buffer::Source::Uri(uri) => {
+            let buffer_path = base_path.join(uri);
+            std::fs::read(&buffer_path)
+                .with_context(|| format!("Failed to read buffer file: {}", buffer_path.display()))
+        }
+        gltf::buffer::Source::Bin => {
+            if let Some(buffers) = imported_buffers {
+                let idx = buffer.index();
+                if let Some(data) = buffers.get(idx as usize) {
+                    Ok(data.0.clone())
+                } else {
+                    anyhow::bail!("No binary data found for buffer index {}", idx);
+                }
+            } else {
+                anyhow::bail!("Binary buffer source encountered but no imported buffers provided")
+            }
+        }
+    }
+}
+
+
+
+fn align_to(value: u32, alignment: u32) -> u32 {
+    ((value + alignment - 1) / alignment) * alignment
+}
