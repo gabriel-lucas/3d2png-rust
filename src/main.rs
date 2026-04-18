@@ -1,58 +1,58 @@
+// main.rs - Complete working version with transforms
 use anyhow::{Context, Result};
 use clap::Parser;
-use gltf::{image::Source};
-use image::{load_from_memory, GenericImageView, ImageBuffer, Rgba};
-use image::io::Reader as ImageReader;
-use std::{path::{Path, PathBuf}, sync::Arc};
-use wgpu::{
-    Backends, Buffer, CommandEncoderDescriptor, Device, Extent3d, Instance, 
-    LoadOp, Operations, Queue, RenderPassColorAttachment, RenderPassDescriptor, 
-    RenderPipeline, RequestAdapterOptions, SurfaceConfiguration, Texture, 
-    TextureFormat, TextureUsages,BindGroup, BufferUsages,
-    StoreOp, TextureDescriptor, TextureDimension, TexelCopyBufferLayout,
-};
-use futures::channel::oneshot;
-use wgpu::util::DeviceExt; // For BufferInitDescriptor
+use gltf::image::Source;
+use image::{GenericImageView, ImageBuffer, Rgba};
+use std::path::{Path, PathBuf};
+use wgpu::*;
+use wgpu::util::DeviceExt;
 
-#[allow(unused_imports)]
-use bytemuck::{Pod, Zeroable};
+use cgmath::{Matrix4, SquareMatrix, Vector3};
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about)]
 struct Args {
-    #[arg(short, long, default_value="models/Avocado.glb")]
+    #[arg(short, long, default_value = "models/Avocado.glb")]
     model: PathBuf,
     #[arg(short, long, default_value = "output.png")]
     output: PathBuf,
-    #[arg(short='W', long, default_value_t = 800)]
+    #[arg(short = 'W', long, default_value_t = 800)]
     width: u32,
-    #[arg(short='H', long, default_value_t = 600)]
+    #[arg(short = 'H', long, default_value_t = 600)]
     height: u32,
 }
 
 struct RenderContext {
-    device: Arc<Device>,
-    queue: Arc<Queue>,
-    config: SurfaceConfiguration,
+    device: Device,
+    queue: Queue,
+    width: u32,
+    height: u32,
     camera_buffer: Buffer,
     camera_bind_group: BindGroup,
-    camera_bind_group_layout: wgpu::BindGroupLayout,
-    depth_view: wgpu::TextureView,
-    default_texture: Texture,
-    material_bind_group_layout: wgpu::BindGroupLayout,
-    material_sampler: wgpu::Sampler,
+    camera_layout: BindGroupLayout,
+    object_layout: BindGroupLayout,
+    depth_view: TextureView,
+    material_layout: BindGroupLayout,
+    sampler: Sampler,
 }
 
 struct Model {
-    meshes: Vec<Mesh>,
+    primitives: Vec<Primitive>,
     materials: Vec<Material>,
+    render_items: Vec<RenderItem>,
+    bounds_min: Vector3<f32>,
+    bounds_max: Vector3<f32>,
 }
 
-struct Mesh {
-    vertex_buffer: Buffer,
-    index_buffer: Buffer,
+struct Primitive {
+    vertex: Buffer,
+    index: Option<Buffer>,
     index_count: u32,
-    material_index: usize,
+    material: usize,
+}
+
+struct RenderItem {
+    primitive: usize,
+    transform: Matrix4<f32>,
 }
 
 struct Material {
@@ -65,108 +65,82 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ObjectUniform {
+    model: [[f32; 4]; 4],
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
-    position: [f32; 3],
-    color: [f32; 2],
+    pos: [f32; 3],
+    uv: [f32; 2],
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let render_context = initialize_wgpu(args.width, args.height).await?;
-    let model = load_gltf(&render_context, &args.model).await?;
-    let material_bind_group_layout = create_material_bind_group_layout(&render_context.device);
-    let pipeline = create_render_pipeline(
-        &render_context.device,
-        &render_context.camera_bind_group_layout,
-        &material_bind_group_layout,
-    );
-    let pixels = render_frame(&render_context, &model, &pipeline).await?;
-    save_image(&args.output, pixels, args.width, args.height)?;
+
+    let ctx = init(args.width, args.height).await?;
+    let model = load_gltf(&ctx, &args.model).await?;
+    let pipeline = create_pipeline(&ctx);
+
+    let pixels = render(&ctx, &model, &pipeline).await?;
+    save(&args.output, pixels, args.width, args.height)?;
+
+    println!("Saved image to {}", args.output.display());
     Ok(())
 }
 
-async fn initialize_wgpu(width: u32, height: u32) -> Result<RenderContext> {
-    let instance = Instance::new(&wgpu::InstanceDescriptor {
-        backends: Backends::all(),
-        flags: wgpu::InstanceFlags::empty(),
-        backend_options: wgpu::BackendOptions {
-            dx12: wgpu::Dx12BackendOptions {
-                shader_compiler: wgpu::Dx12Compiler::default(),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    });
+async fn init(width: u32, height: u32) -> Result<RenderContext> {
+    let instance = Instance::default();
 
     let adapter = instance
         .request_adapter(&RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
+            power_preference: PowerPreference::HighPerformance,
             compatible_surface: None,
-            force_fallback_adapter: true,
+            force_fallback_adapter: false,
         })
         .await
-        .context("Failed to find suitable GPU adapter")?;
+        .ok_or_else(|| anyhow::anyhow!("Failed to find a suitable GPU adapter"))?;
 
     let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::default(),
-            },
-            None,
-        )
-        .await
-        .context("Failed to create GPU device")?;
+        .request_device(&DeviceDescriptor::default(), None)
+        .await?;
 
-    let config = wgpu::SurfaceConfiguration {
-        usage: TextureUsages::RENDER_ATTACHMENT,
-        format: TextureFormat::Rgba8UnormSrgb,
-        width,
-        height,
-        present_mode: wgpu::PresentMode::Fifo,
-        alpha_mode: wgpu::CompositeAlphaMode::Auto,
-        view_formats: vec![],
-        desired_maximum_frame_latency: 2,
-    };
-
-    let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Camera Buffer"),
+    let camera_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("camera"),
         size: std::mem::size_of::<CameraUniform>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
 
-    let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        entries: &[wgpu::BindGroupLayoutEntry {
+    let camera_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("camera_layout"),
+        entries: &[BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
+            visibility: ShaderStages::VERTEX,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },
             count: None,
         }],
-        label: Some("camera_bind_group_layout"),
     });
 
-    let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        layout: &camera_bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
+    let camera_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        layout: &camera_layout,
+        entries: &[BindGroupEntry {
             binding: 0,
             resource: camera_buffer.as_entire_binding(),
         }],
         label: Some("camera_bind_group"),
     });
 
-    let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Depth Texture"),
+    let depth_texture = device.create_texture(&TextureDescriptor {
+        label: Some("depth_texture"),
         size: Extent3d {
             width,
             height,
@@ -175,341 +149,588 @@ async fn initialize_wgpu(width: u32, height: u32) -> Result<RenderContext> {
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth24Plus,
+        format: TextureFormat::Depth24Plus,
         usage: TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
 
-    let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let default_texture = create_solid_color_texture(&device, &queue, [255, 255, 255, 255]); // White
-    
-    let material_bind_group_layout = create_material_bind_group_layout(&device);
-    let material_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("Default Material Sampler"),
-        address_mode_u: wgpu::AddressMode::Repeat,
-        address_mode_v: wgpu::AddressMode::Repeat,
-        address_mode_w: wgpu::AddressMode::Repeat,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::FilterMode::Linear,
-        ..Default::default()
+    let object_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("object_layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
     });
 
+    let material_layout = create_material_layout(&device);
+    let sampler = device.create_sampler(&SamplerDescriptor::default());
 
     Ok(RenderContext {
-        device: Arc::new(device),
-        queue: Arc::new(queue),
-        config,
+        device,
+        queue,
+        width,
+        height,
         camera_buffer,
         camera_bind_group,
-        camera_bind_group_layout,
-        depth_view,
-        default_texture,
-        material_bind_group_layout,
-        material_sampler,
+        camera_layout,
+        object_layout,
+        depth_view: depth_texture.create_view(&Default::default()),
+        material_layout,
+        sampler,
     })
 }
 
-async fn load_gltf(context: &RenderContext, path: &PathBuf) -> Result<Model> {
-    let (gltf, imported_buffers, _imported_images) = gltf::import(path).context("Failed to parse glTF")?;
-    
-    if !gltf.extensions_used().len()==0 {
-        anyhow::bail!("Unsuported extensions in {}: {:?}",path.display(), gltf.extensions_used());
+fn node_transform(node: &gltf::Node) -> cgmath::Matrix4<f32> {
+    use cgmath::*;
+
+    match node.transform() {
+        gltf::scene::Transform::Matrix { matrix } => Matrix4::from(matrix),
+        gltf::scene::Transform::Decomposed {
+            translation,
+            rotation,
+            scale,
+        } => {
+            let t = Matrix4::from_translation(Vector3::from(translation));
+            let r = Matrix4::from(Quaternion::from(rotation));
+            let s = Matrix4::from_nonuniform_scale(scale[0], scale[1], scale[2]);
+            t * r * s
+        }
     }
-    let mut materials = Vec::new();
-    let mut textures = Vec::new();
+}
 
-    let base_dir = path.parent().unwrap_or(Path::new("."));
+fn traverse_node(
+    node: gltf::Node,
+    parent_transform: Matrix4<f32>,
+    mesh_primitive_map: &[Vec<usize>],
+    render_items: &mut Vec<RenderItem>,
+) {
+    let local_transform = node_transform(&node);
+    let world_transform = parent_transform * local_transform;
 
-    for image in gltf.images() {
-        match image.source() {
-            Source::Uri { uri, .. } => {
-                let texture_path = base_dir.join(uri);
-                let texture = load_texture(context, &texture_path).await?;
-                textures.push(texture);
+    if let Some(mesh) = node.mesh() {
+        if let Some(primitive_indices) = mesh_primitive_map.get(mesh.index()) {
+            for &prim_idx in primitive_indices {
+                render_items.push(RenderItem {
+                    primitive: prim_idx,
+                    transform: world_transform,
+                });
             }
-            //Source::Buffer => {
-            //    let texture = load_embedded_texture(context, &image)?;
-            //    textures.push(texture);
-            //}
+        }
+    }
 
+    for child in node.children() {
+        traverse_node(child, world_transform, mesh_primitive_map, render_items);
+    }
+}
+
+async fn load_gltf(ctx: &RenderContext, path: &Path) -> Result<Model> {
+    //use cgmath::{Matrix4, Vector3, Transform, Point3};
+    use cgmath::{Matrix4, Vector3, Transform, Point3, EuclideanSpace};
+    //use cgmath::{Matrix4, Vector3, Point3, EuclideanSpace, SquareMatrix};
+    
+    let (doc, buffers, _) = gltf::import(path)?;
+    let base = path.parent().context("Model has no parent directory")?;
+
+    // ---- Images -> GPU textures ----
+    let mut images = Vec::new();
+    for img in doc.images() {
+        let data = match img.source() {
+            Source::Uri { uri, .. } => std::fs::read(base.join(uri))?,
             Source::View { view, .. } => {
-                let buffer = view.buffer();
-                let buffer_data = get_buffer_data(&buffer, base_dir,Some(&imported_buffers[..]))?;
-                let offset = view.offset();
-                let length = view.length();
-                let image_data = &buffer_data[offset..offset + length];
-                // Decode the image from the embedded data.
-                let img = load_from_memory(image_data)
-                    .context("Failed to decode embedded texture image")?;
-                let rgba = img.to_rgba8();
-                textures.push(create_texture_from_image(context, &rgba, img.dimensions())?);
+                let buf = &buffers[view.buffer().index()].0;
+                buf[view.offset()..view.offset() + view.length()].to_vec()
+            }
+        };
+        let image = image::load_from_memory(&data).context("Failed to decode image")?;
+        images.push(upload_texture(ctx, &image));
+    }
+
+    // ---- Default texture ----
+    let default_tex = {
+        let data = [255u8, 255, 255, 255];
+        let tex = ctx.device.create_texture(&TextureDescriptor {
+            size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            label: Some("default_white_texture"),
+            view_formats: &[],
+        });
+        ctx.queue.write_texture(
+            tex.as_image_copy(),
+            &data,
+            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        tex
+    };
+
+    // ---- glTF textures -> GPU textures ----
+    let mut textures = Vec::new();
+    for tex in doc.textures() {
+        textures.push(&images[tex.source().index()]);
+    }
+
+    // ---- Materials ----
+    let mut materials = Vec::new();
+    for mat in doc.materials() {
+        let tex = mat.pbr_metallic_roughness()
+            .base_color_texture()
+            .map(|t| t.texture().index())
+            .and_then(|i| textures.get(i).copied())
+            .unwrap_or(&default_tex);
+        let view = tex.create_view(&Default::default());
+        let bind = ctx.device.create_bind_group(&BindGroupDescriptor {
+            layout: &ctx.material_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&ctx.sampler) },
+            ],
+            label: None,
+        });
+        materials.push(Material { bind_group: bind });
+    }
+
+    // ---- Read all primitive data (CPU side) ----
+    struct CpuPrimitive {
+        vertices: Vec<Vertex>,
+        indices: Option<Vec<u32>>,
+        material: usize,
+    }
+    let mut cpu_primitives = Vec::new();
+
+    for mesh in doc.meshes() {
+        for prim in mesh.primitives() {
+            let reader = prim.reader(|b| Some(&buffers[b.index()].0));
+            let positions: Vec<_> = reader.read_positions().context("No positions")?.collect();
+            let uvs: Vec<_> = reader
+                .read_tex_coords(0)
+                .map(|c| c.into_f32().collect())
+                .unwrap_or(vec![[0.0, 0.0]; positions.len()]);
+            let vertices: Vec<Vertex> = positions
+                .into_iter()
+                .zip(uvs)
+                .map(|(p, uv)| Vertex { pos: p, uv })
+                .collect();
+            let indices = reader.read_indices().map(|indices| indices.into_u32().collect());
+            cpu_primitives.push(CpuPrimitive {
+                vertices,
+                indices,
+                material: prim.material().index().unwrap_or(0),
+            });
+        }
+    }
+
+    // ---- Build mapping from (mesh, primitive) to cpu_primitives index ----
+    let mut primitive_index = 0;
+    let mut mesh_primitive_map = Vec::new();
+    for mesh in doc.meshes() {
+        let mut prim_indices = Vec::new();
+        for _ in mesh.primitives() {
+            prim_indices.push(primitive_index);
+            primitive_index += 1;
+        }
+        mesh_primitive_map.push(prim_indices);
+    }
+
+    // ---- Traverse scene to build render_items and collect world positions for bounds ----
+    let mut render_items = Vec::new();
+    let mut world_positions = Vec::new();
+
+    fn traverse_and_collect(
+        node: gltf::Node,
+        parent_transform: Matrix4<f32>,
+        mesh_primitive_map: &[Vec<usize>],
+        cpu_primitives: &[CpuPrimitive],
+        render_items: &mut Vec<RenderItem>,
+        world_positions: &mut Vec<Vector3<f32>>,
+    ) {
+        let local_transform = node_transform(&node);
+        let world_transform = parent_transform * local_transform;
+
+        if let Some(mesh) = node.mesh() {
+            if let Some(prim_indices) = mesh_primitive_map.get(mesh.index()) {
+                for &prim_idx in prim_indices {
+                    render_items.push(RenderItem {
+                        primitive: prim_idx,
+                        transform: world_transform,
+                    });
+                    // Add transformed vertices for bounds
+                    let prim = &cpu_primitives[prim_idx];
+                    for vertex in &prim.vertices {
+                        let pos = Vector3::new(vertex.pos[0], vertex.pos[1], vertex.pos[2]);
+                        let world_pos = world_transform.transform_point(Point3::new(pos.x, pos.y, pos.z));
+                        world_positions.push(world_pos.to_vec());
+                    }
+                }
             }
         }
-    }
 
-    for material in gltf.materials() {
-      
-        // Get texture index from PBR parameters (not material index)
-        let texture_index = material.pbr_metallic_roughness()
-            .base_color_texture()
-            .map(|tex_info| tex_info.texture().index())
-            .unwrap_or(0);  // Fallback to first texture
-
-        // Handle invalid indices by using default texture
-        let texture = textures.get(texture_index)
-            .unwrap_or(&context.default_texture);
-
-
-        let bind_group = create_material_bind_group(context, texture)?;
-
-        //let bind_group = create_material_bind_group(context, &material, texture)?;
-
-        //let bind_group = create_material_bind_group(context, &material, &textures).context(format!("Failed to create bind group for material {}", material.index().unwrap_or(0)))?;
-
-        //let bind_group = create_material_bind_group(context, &material, &textures)?;
-        materials.push(Material { bind_group });
-    }
-    
-     // Create default material if none exist
-    if materials.is_empty() {
-        let bind_group = create_material_bind_group(context, &context.default_texture)?;
-        materials.push(Material { bind_group });
-    }
-
-
-    let mut meshes = Vec::new();
-    for mesh in gltf.meshes() {
-        let primitives: Vec<_> = mesh.primitives().collect();
-        if primitives.is_empty() {
-            anyhow::bail!("Mesh '{}' has no primitives", mesh.name().unwrap_or("unnamed"));
+        for child in node.children() {
+            traverse_and_collect(
+                child,
+                world_transform,
+                mesh_primitive_map,
+                cpu_primitives,
+                render_items,
+                world_positions,
+            );
         }
-        let primitive = &primitives[0];
-        if primitives.len() > 1 {
-            anyhow::bail!("Using first primitive of {} in {}", primitives.len(), mesh.name().unwrap_or("unnamed"));
-        }
-        //let primitive = mesh.primitives().next().context("No primitives in mesh")?;
-        let (vertex_buffer, index_buffer, index_count) = load_mesh(context, &primitive, &imported_buffers)?;
+    }
 
-        let material_index = primitive.material().index().unwrap_or(0).clamp(0, materials.len().saturating_sub(1));
+    let scene = doc.default_scene().unwrap_or_else(|| doc.scenes().next().unwrap());
+    for node in scene.nodes() {
+        traverse_and_collect(
+            node,
+            Matrix4::identity(),
+            &mesh_primitive_map,
+            &cpu_primitives,
+            &mut render_items,
+            &mut world_positions,
+        );
+    }
 
-        meshes.push(Mesh {
-            vertex_buffer,
-            index_buffer,
-            index_count,
-            material_index, //: primitive.material().index().unwrap_or(0),
+    // ---- Compute bounding box ----
+    let mut bounds_min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut bounds_max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for pos in &world_positions {
+        bounds_min.x = bounds_min.x.min(pos.x);
+        bounds_min.y = bounds_min.y.min(pos.y);
+        bounds_min.z = bounds_min.z.min(pos.z);
+        bounds_max.x = bounds_max.x.max(pos.x);
+        bounds_max.y = bounds_max.y.max(pos.y);
+        bounds_max.z = bounds_max.z.max(pos.z);
+    }
+    if world_positions.is_empty() {
+        bounds_min = Vector3::new(-1.0, -1.0, -1.0);
+        bounds_max = Vector3::new(1.0, 1.0, 1.0);
+    }
+
+    println!("Bounds min: {:?}, max: {:?}", bounds_min, bounds_max);
+    println!("Center: {:?}", (bounds_min + bounds_max) / 2.0);
+    println!("Size: {:?}", bounds_max - bounds_min);
+
+    // ---- Upload primitives to GPU ----
+    let mut primitives = Vec::new();
+    for cpu_prim in cpu_primitives {
+        let vertex = ctx.device.create_buffer_init(&util::BufferInitDescriptor {
+            contents: bytemuck::cast_slice(&cpu_prim.vertices),
+            usage: BufferUsages::VERTEX,
+            label: None,
+        });
+        let (index, count) = if let Some(indices) = cpu_prim.indices {
+            let buf = ctx.device.create_buffer_init(&util::BufferInitDescriptor {
+                contents: bytemuck::cast_slice(&indices),
+                usage: BufferUsages::INDEX,
+                label: None,
+            });
+            (Some(buf), indices.len() as u32)
+        } else {
+            (None, cpu_prim.vertices.len() as u32)
+        };
+        primitives.push(Primitive {
+            vertex,
+            index,
+            index_count: count,
+            material: cpu_prim.material,
         });
     }
 
-    Ok(Model { meshes, materials })
+    Ok(Model {
+        primitives,
+        materials,
+        render_items,
+        bounds_min,
+        bounds_max,
+    })
 }
 
-fn create_texture_from_image(
-    context: &RenderContext,
-    rgba: &[u8],
-    (width, height): (u32, u32),
-) -> Result<Texture> {
-    let size = Extent3d {
-        width,
-        height,
-        depth_or_array_layers: 1,
-    };
+fn upload_texture(ctx: &RenderContext, img: &image::DynamicImage) -> Texture {
+    let rgba = img.to_rgba8();
+    let (w, h) = img.dimensions();
 
-    let texture = context.device.create_texture(&TextureDescriptor {
-        label: Some("Texture"),
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8UnormSrgb,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-
-    context.queue.write_texture(
-        texture.as_image_copy(),
-        &rgba,
-        wgpu::TexelCopyBufferLayout {  // Changed from ImageDataLayout
-            offset: 0,
-            bytes_per_row: Some(align_to(4 * width , 256)),
-            rows_per_image: Some(height),
-        },
-        size,
-    );
-    Ok(texture)
-}
-
-fn create_solid_color_texture(device: &Device, queue: &Queue, color: [u8; 4]) -> Texture {
-    let size = Extent3d { width: 1, height: 1, depth_or_array_layers: 1 };
-    let texture = device.create_texture(&TextureDescriptor {
-        label: Some("Default Texture"),
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8UnormSrgb,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-
-    queue.write_texture(
-        texture.as_image_copy(),
-        &color,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(align_to(4, 256)),
-            rows_per_image: Some(1),
-        },
-        size,
-    );
-
-    texture
-}
-
-
-
-async fn render_frame(
-    context: &RenderContext,
-    model: &Model,
-    pipeline: &RenderPipeline,
-) -> Result<Vec<u8>> {
-    
-    let rotation_angle_deg : f32 =135.0; // Change this value to rotate
-    let rotation_angle = rotation_angle_deg.to_radians();
-    let camera_distance = 2.0; // Distance from object
-
-    // Calculate camera position using polar coordinates
-    let camera_pos = cgmath::Point3::new(
-        rotation_angle.sin() * camera_distance,
-        0.5,  // Fixed height
-        rotation_angle.cos() * camera_distance
-    );
-
-    // Update camera matrix
-    let aspect_ratio = context.config.width as f32 / context.config.height as f32;
-    let view_proj = cgmath::perspective(cgmath::Deg(45.0), aspect_ratio, 0.1, 100.0)
-        * cgmath::Matrix4::look_at_rh(
-            camera_pos,
-            cgmath::Point3::new(0.0, 0.5, 0.0),   // Looking at origin
-            cgmath::Vector3::new(0.0, 1.0, 0.0), // Up vector
-        )
-        * cgmath::Matrix4::from_scale(15.0);
-    
-    
-    let view_proj_uniform = CameraUniform {
-        view_proj: view_proj.into(),
-    };
-    context.queue.write_buffer(
-        &context.camera_buffer,
-        0,
-        bytemuck::cast_slice(&[view_proj_uniform]),
-    );
-    
-    let texture = context.device.create_texture(&TextureDescriptor {
-        label: None,
+    let tex = ctx.device.create_texture(&TextureDescriptor {
         size: Extent3d {
-            width: context.config.width,
-            height: context.config.height,
+            width: w,
+            height: h,
             depth_or_array_layers: 1,
         },
+        format: TextureFormat::Rgba8UnormSrgb,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8UnormSrgb,
-        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        label: None,
         view_formats: &[],
     });
 
-    let view = texture.create_view(&Default::default());
+    ctx.queue.write_texture(
+        tex.as_image_copy(),
+        &rgba,
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * w),
+            rows_per_image: Some(h),
+        },
+        Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    tex
+}
+
+fn create_pipeline(ctx: &RenderContext) -> RenderPipeline {
+    let shader = ctx.device.create_shader_module(include_wgsl!("shader.wgsl"));
+
+    let layout = ctx.device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        bind_group_layouts: &[&ctx.camera_layout, &ctx.material_layout, &ctx.object_layout],
+        push_constant_ranges: &[],
+        label: Some("pipeline_layout"),
+    });
+
+    ctx.device.create_render_pipeline(&RenderPipelineDescriptor {
+        layout: Some(&layout),
+        vertex: VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[VertexBufferLayout {
+                array_stride: std::mem::size_of::<Vertex>() as _,
+                step_mode: VertexStepMode::Vertex,
+                attributes: &[
+                    VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: VertexFormat::Float32x3,
+                    },
+                    VertexAttribute {
+                        offset: 12,
+                        shader_location: 1,
+                        format: VertexFormat::Float32x2,
+                    },
+                ],
+            }],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: TextureFormat::Rgba8UnormSrgb,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth24Plus,
+            depth_write_enabled: true,
+            depth_compare: CompareFunction::Less,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        primitive: Default::default(),
+        multisample: Default::default(),
+        multiview: None,
+        cache: None,
+        label: Some("render_pipeline"),
+    })
+}
+
+async fn render(ctx: &RenderContext, model: &Model, pipeline: &RenderPipeline) -> Result<Vec<u8>> {
+    use cgmath::*;
     
-    let mut encoder = context.device.create_command_encoder(&CommandEncoderDescriptor::default());
-    
+        // Auto-frame camera based on model bounds
+    let center = (model.bounds_min + model.bounds_max) / 2.0;
+    let size = model.bounds_max - model.bounds_min;
+    let radius = size.magnitude() / 2.0; // half diagonal
+
+    // Compute distance needed for vertical FOV
+    let fov_rad = 45.0_f32.to_radians();
+    let distance_vertical = radius / (fov_rad / 2.0).tan();
+
+    // Also consider horizontal FOV based on aspect ratio
+    let aspect = ctx.width as f32 / ctx.height as f32;
+    let horizontal_fov = 2.0 * (aspect * (fov_rad / 2.0).tan()).atan();
+    let distance_horizontal = radius / (horizontal_fov / 2.0).tan();
+
+    // Take the larger distance to ensure both axes fit
+    let distance = distance_vertical.max(distance_horizontal) * 1.2; // 20% margin
+
+    // Place camera at a direction that gives a good view (from +X, +Y, +Z)
+    let direction = Vector3::new(1.0, 1.0, 1.0).normalize();
+    let eye = center + direction * distance;
+    let target = center;
+
+    let cam = Matrix4::look_at_rh(Point3::from_vec(eye), Point3::from_vec(target), Vector3::unit_y());
+    let proj = perspective(Deg(45.0), aspect, 0.01, distance * 3.0);
+    let vp = proj * cam;
+
+    ctx.queue.write_buffer(
+        &ctx.camera_buffer,
+        0,
+        bytemuck::cast_slice(&[CameraUniform {
+            view_proj: vp.into(),
+        }]),
+    );
+
+    // Prepare transforms for all render items
+    let mut transforms = Vec::new();
+    for item in &model.render_items {
+        transforms.push(ObjectUniform {
+            model: item.transform.into(),
+        });
+    }
+
+    // Create a single buffer large enough for all transforms
+    let transform_size = std::mem::size_of::<ObjectUniform>() as u64;
+    let total_size = transform_size * transforms.len() as u64;
+    let transform_buffer = ctx.device.create_buffer(&BufferDescriptor {
+        label: Some("transform_buffer"),
+        size: total_size,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Write all transforms
+    if !transforms.is_empty() {
+        ctx.queue.write_buffer(&transform_buffer, 0, bytemuck::cast_slice(&transforms));
+    }
+
+    // Create one bind group that references the whole buffer
+    let object_bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
+        layout: &ctx.object_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: BindingResource::Buffer(BufferBinding {
+                buffer: &transform_buffer,
+                offset: 0,
+                size: None,
+            }),
+        }],
+        label: Some("object_bind_group"),
+    });
+
+    // Create output texture
+    let tex = ctx.device.create_texture(&TextureDescriptor {
+        size: Extent3d {
+            width: ctx.width,
+            height: ctx.height,
+            depth_or_array_layers: 1,
+        },
+        format: TextureFormat::Rgba8UnormSrgb,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        label: Some("output_texture"),
+        view_formats: &[],
+    });
+
+    let view = tex.create_view(&Default::default());
+
+    let mut enc = ctx.device.create_command_encoder(&Default::default());
+
     {
-        let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
-            label: Some("Render Pass"),
+        let mut pass = enc.begin_render_pass(&RenderPassDescriptor {
             color_attachments: &[Some(RenderPassColorAttachment {
                 view: &view,
                 resolve_target: None,
                 ops: Operations {
-                    load: LoadOp::Clear(wgpu::Color::BLACK),
+                    load: LoadOp::Clear(Color::BLACK),
                     store: StoreOp::Store,
                 },
             })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &context.depth_view, 
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: &ctx.depth_view,
                 depth_ops: Some(Operations {
                     load: LoadOp::Clear(1.0),
                     store: StoreOp::Store,
                 }),
                 stencil_ops: None,
             }),
+            label: Some("render_pass"),
             occlusion_query_set: None,
             timestamp_writes: None,
         });
 
-        // Set camera bind group
-        render_pass.set_bind_group(0, &context.camera_bind_group, &[]);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &ctx.camera_bind_group, &[]);
 
-        render_pass.set_pipeline(pipeline);
-        
-        for mesh in &model.meshes {
-            render_pass.set_bind_group(1, &model.materials[mesh.material_index].bind_group, &[]);
-            render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        // Draw each primitive with its transform
+        for (i, item) in model.render_items.iter().enumerate() {
+            let prim = &model.primitives[item.primitive];
+            let dynamic_offset = (i * transform_size as usize) as u32;
+
+            pass.set_bind_group(2, &object_bind_group, &[dynamic_offset]);
+            pass.set_bind_group(1, &model.materials[prim.material].bind_group, &[]);
+            pass.set_vertex_buffer(0, prim.vertex.slice(..));
+
+            if let Some(idx) = &prim.index {
+                pass.set_index_buffer(idx.slice(..), IndexFormat::Uint32);
+                pass.draw_indexed(0..prim.index_count, 0, 0..1);
+            } else {
+                pass.draw(0..prim.index_count, 0..1);
+            }
         }
     }
 
-    let bytes_per_row = align_to(4 * context.config.width, 256);
-    let buffer_size = (bytes_per_row * context.config.height) as u64;
+    // Read back pixels
+    let padded_bytes_per_row = align_to(4 * ctx.width, 256);
+    let buffer_size = (padded_bytes_per_row * ctx.height) as u64;
 
-    let buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
+    let buffer = ctx.device.create_buffer(&BufferDescriptor {
         size: buffer_size,
         usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
         mapped_at_creation: false,
+        label: Some("readback_buffer"),
     });
 
-    encoder.copy_texture_to_buffer(
-        texture.as_image_copy(),
-        wgpu::TexelCopyBufferInfo {
+    enc.copy_texture_to_buffer(
+        tex.as_image_copy(),
+        TexelCopyBufferInfo {
             buffer: &buffer,
-            layout: wgpu::TexelCopyBufferLayout {
+            layout: TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(context.config.height),
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(ctx.height),
             },
         },
         Extent3d {
-            width: context.config.width,
-            height: context.config.height,
+            width: ctx.width,
+            height: ctx.height,
             depth_or_array_layers: 1,
         },
     );
 
-    context.queue.submit(Some(encoder.finish()));
-    
+    ctx.queue.submit(Some(enc.finish()));
+
     let slice = buffer.slice(..);
-    let (sender, receiver) = oneshot::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
-    });
-    
-    context.device.poll(wgpu::Maintain::Wait);
-    receiver.await??;
-    
+    slice.map_async(MapMode::Read, |_| {});
+    ctx.device.poll(Maintain::Wait);
+
     let data = slice.get_mapped_range();
-    let mut pixels = Vec::with_capacity((context.config.width * context.config.height * 4) as usize);
-    let aligned_bytes_per_row = align_to(4 * context.config.width, 256) as usize;
-    let actual_bytes_per_row = (4 * context.config.width) as usize;
 
-    for y in 0..context.config.height {
-        let y = y as usize;
-        let row_start = (y * aligned_bytes_per_row) as usize;
-        let row_end = row_start + actual_bytes_per_row;
-        pixels.extend_from_slice(&data[row_start..row_end]);
+    let mut pixels = Vec::with_capacity((ctx.width * ctx.height * 4) as usize);
+
+    let padded = align_to(4 * ctx.width, 256) as usize;
+    let row_size = (4 * ctx.width) as usize;
+
+    for y in 0..ctx.height as usize {
+        let start = y * padded;
+        let end = start + row_size;
+        pixels.extend_from_slice(&data[start..end]);
     }
-
 
     drop(data);
     buffer.unmap();
@@ -517,425 +738,36 @@ async fn render_frame(
     Ok(pixels)
 }
 
-
-fn save_image(path: &PathBuf, pixels: Vec<u8>, width: u32, height: u32) -> Result<()> {  
-    println!("Image saved: {}", path.display());
-    ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, pixels)
-        .context("Invalid image dimensions")?
-        .save(path)
-        .context("Failed to save image")
+fn save(path: &Path, pixels: Vec<u8>, w: u32, h: u32) -> Result<()> {
+    ImageBuffer::<Rgba<u8>, _>::from_raw(w, h, pixels)
+        .context("Invalid image buffer")?
+        .save(path)?;
+    Ok(())
 }
 
-
-/// Load a texture from a URI-based source.
-/// This function reads the image file from disk (using the given `uri`)
-/// relative to the glTF file’s directory, decodes it, and uploads it to GPU.
-async fn load_texture(context: &RenderContext, uri: &Path) -> Result<Texture> {
-    // Read the file into memory.
-    //let data = std::fs::read(uri).with_context(|| format!("Failed to read texture file: {}", uri.display()))?;
-    
-    let img = ImageReader::open(uri)?.decode()?;
-    //let img = load_from_memory(&data).context("Failed to decode texture image");
-    // Decode the image data.
-    //let img = load_from_memory(&data).context("Failed to decode texture image")?;
-    let rgba = img.to_rgba8();
-    let (width, height) = img.dimensions();
-    let size = Extent3d {
-        width,
-        height,
-        depth_or_array_layers: 1,
-    };
-
-    // Create the GPU texture.
-    let texture = context.device.create_texture(&TextureDescriptor {
-        label: Some(&format!("Texture: {}", uri.display())),
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8UnormSrgb,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-
-    // Upload the texture data.
-    context.queue.write_texture(
-        texture.as_image_copy(),
-        &rgba,
-        TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(align_to(4 * width, 256)),
-            rows_per_image: Some(height),
-        },
-        size,
-    );
-    Ok(texture)
-}
-
-/// Load an embedded texture from a buffer view.
-/// This function uses the information from the glTF image's Source::View variant:
-/// it gets the buffer via `View::buffer()` (see [docs](https://docs.rs/gltf/latest/gltf/buffer/struct.View.html#method.buffer)),
-/// then extracts the sub-slice corresponding to the image (using the view’s offset and length),
-/// decodes it, and creates a GPU texture.
-#[allow(dead_code)]
-fn load_embedded_texture(
-    context: &RenderContext,
-    image: &gltf::image::Image,
-    base_path: &Path,
-) -> Result<Texture> {
-    match image.source() {
-        Source::View { view, mime_type: _ } => {
-            // Get the buffer associated with the view.
-            let buffer = view.buffer();
-            // Load the entire buffer data.
-            let buffer_data = get_buffer_data(&buffer, base_path, None)?;
-            // Slice out the image data using the view's offset and length.
-            let offset = view.offset();
-            let length = view.length();
-            let image_data = &buffer_data[offset..offset + length];
-            // Decode the image.
-            let img = load_from_memory(image_data)
-                .context("Failed to decode embedded texture image")?;
-            let rgba = img.to_rgba8();
-            let (width, height) = img.dimensions();
-            let size = Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            };
-
-            let texture = context.device.create_texture(&TextureDescriptor {
-                label: Some("Embedded Texture"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba8UnormSrgb,
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-
-            context.queue.write_texture(
-                texture.as_image_copy(),
-                &rgba,
-                TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * width),
-                    rows_per_image: Some(height),
-                },
-                size,
-            );
-            Ok(texture)
-        }
-        _ => {
-            anyhow::bail!("Image source is not embedded")
-        }
-    }
-}
-
-/// Creates a simple render pipeline using an inline WGSL shader.
-/// Make sure to have a file named `shader.wgsl` in your project directory.
-fn create_render_pipeline(
-    device: &Device,
-    camera_bind_group_layout: &wgpu::BindGroupLayout,
-    material_bind_group_layout: &wgpu::BindGroupLayout,
-) -> RenderPipeline {
-
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Simple Shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-    });
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("Pipeline Layout"),
-        bind_group_layouts:  &[camera_bind_group_layout, material_bind_group_layout],
-        push_constant_ranges: &[],
-    });
-
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Render Pipeline"),
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &[
-                    wgpu::VertexAttribute {
-                        offset: 0,
-                        shader_location: 0,
-                        format: wgpu::VertexFormat::Float32x3,
-                    },
-                    wgpu::VertexAttribute {
-                        offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                        shader_location: 1,
-                        format: wgpu::VertexFormat::Float32x3,
-                    },
-                ],
-            }],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: TextureFormat::Rgba8UnormSrgb,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth24Plus,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList, // Add this line
-            ..Default::default()
-        },
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-        cache: Default::default(),
-    })
-}
-
-
-fn create_material_bind_group(
-    context: &RenderContext,
-    texture: &Texture,
-) -> Result<BindGroup> {
-    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-    let bind_group = context.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Material Bind Group"),
-        layout: &context.material_bind_group_layout,
+fn create_material_layout(device: &Device) -> BindGroupLayout {
+    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("material_layout"),
         entries: &[
-            wgpu::BindGroupEntry {
+            BindGroupLayoutEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&texture_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&context.material_sampler),
-            },
-        ],
-    });
-
-    Ok(bind_group)
-}
-
-fn create_material_bind_group2(
-    context: &RenderContext,
-    material: &gltf::Material,
-    textures: &[Texture],
-) -> Result<BindGroup> {
-    
-    let pbr = material.pbr_metallic_roughness();
-    
-    let texture_info = pbr.base_color_texture().context("Material has no base color texture")?;
-
-    let texture_index = texture_info.texture().index();
-    let texture = textures.get(texture_index)
-        .with_context(|| format!(
-            "Material references invalid texture index {} (textures available: {})",
-            texture_index,
-            textures.len()
-        ))?;
-
-    // Get the actual texture index from the material's PBR parameters
-    //let texture_index = material.pbr_metallic_roughness()
-    //    .base_color_texture()
-    //   .map(|tex_info| tex_info.texture().index())
-    //    .unwrap_or(0);  // Default to first texture if none specified
-
-    // Handle invalid texture indices
-    //let texture = textures.get(texture_index).unwrap_or_else(|| {
-    //    anyhow::bail!("Material references invalid texture index {}, using default", texture_index);
-    //    &DEFAULT_TEXTURE
-    //});
-
-    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    
-    let sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("Material Sampler"),
-        address_mode_u: wgpu::AddressMode::Repeat,
-        address_mode_v: wgpu::AddressMode::Repeat,
-        address_mode_w: wgpu::AddressMode::Repeat,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::FilterMode::Linear,
-        ..Default::default()
-    });
-
-    let bind_group_layout = context.device.create_bind_group_layout(
-        &wgpu::BindGroupLayoutDescriptor {
-            label: Some("Material Bind Group Layout"),
-            entries: &[
-                // Texture
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
-                // Sampler
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        },
-    );
-
-    let bind_group = context.device.create_bind_group(
-        &wgpu::BindGroupDescriptor {
-            label: Some("Material Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        },
-    );
-
-    Ok(bind_group)
-}
-
-fn create_material_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Material Bind Group Layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
                     multisampled: false,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    sample_type: TextureSampleType::Float { filterable: true },
                 },
                 count: None,
             },
-            wgpu::BindGroupLayoutEntry {
+            BindGroupLayoutEntry {
                 binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
         ],
     })
 }
-
-
-fn load_mesh(
-    context: &RenderContext,
-    primitive: &gltf::Primitive,
-    imported_buffers: &[gltf::buffer::Data],
-) -> Result<(Buffer, Buffer, u32)> {
-    let reader = primitive.reader(|buffer| Some(&imported_buffers[buffer.index()].0));
-
-    // Get vertex positions
-    let positions: Vec<[f32; 3]> = reader
-        .read_positions()
-        .context("No positions in mesh")?
-        .collect();
-
-    // Get vertex colors (COLOR_0)
-    let colors: Vec<[f32; 3]> = reader.read_colors(0);
-        //.context("No vertex colors in mesh")?
-        //.RgbF32()
-        //.collect(); 
-
-
-    // Get vertex texture coordinates (UVs) – use default if missing
-    //let tex_coords: Vec<[f32; 2]> = if let Some(coords) = reader.read_tex_coords(0) {
-    //    coords.into_f32().collect()
-    //} else {
-        // Use [0.0, 0.0] for every vertex if no UVs are provided
-    //    vec![[0.0, 0.0]; positions.len()]
-    //};
-
-    // When building vertices, do NOT flip the v coordinate unless needed:
-    let vertices: Vec<Vertex> = positions
-        .into_iter()
-        .zip(colors) //tex_coords)
-        .map(|(position, color)| Vertex { position, color })       // uv)| Vertex { position, uv })
-        .collect();
-
-
-    // Get indices
-    let indices = reader
-        .read_indices()
-        .context("No indices in mesh")?
-        .into_u32()
-        .collect::<Vec<_>>();
-
-
-    let vertex_buffer = context.device.create_buffer_init(
-        &wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        },
-    );
-
-    let index_buffer = context.device.create_buffer_init(
-        &wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        },
-    );
-
-    Ok((vertex_buffer, index_buffer, indices.len() as u32))
-}
-
-
-/// Helper function to load the data for a glTF buffer.
-/// This function reads the file for the buffer based on its source URI.
-/// (See [gltf::buffer::Source](https://docs.rs/gltf/latest/gltf/buffer/enum.Source.html))
-fn get_buffer_data(
-    buffer: &gltf::buffer::Buffer,
-    base_path: &Path,
-    imported_buffers: Option<&[gltf::buffer::Data]>
-) -> Result<Vec<u8>> {
-    match buffer.source() {
-        gltf::buffer::Source::Uri(uri) => {
-            let buffer_path = base_path.join(uri);
-            std::fs::read(&buffer_path)
-                .with_context(|| format!("Failed to read buffer file: {}", buffer_path.display()))
-        }
-        gltf::buffer::Source::Bin => {
-            if let Some(buffers) = imported_buffers {
-                let idx = buffer.index();
-                if let Some(data) = buffers.get(idx as usize) {
-                    Ok(data.0.clone())
-                } else {
-                    anyhow::bail!("No binary data found for buffer index {}", idx);
-                }
-            } else {
-                anyhow::bail!("Binary buffer source encountered but no imported buffers provided")
-            }
-        }
-    }
-}
-
-
 
 fn align_to(value: u32, alignment: u32) -> u32 {
     ((value + alignment - 1) / alignment) * alignment
