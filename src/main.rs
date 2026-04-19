@@ -1,13 +1,12 @@
-// main.rs - Complete working version with transforms
+// main.rs - Optimized version with alignment fix, buffer reuse, AABB bounds, and frustum culling
 use anyhow::{Context, Result};
 use clap::Parser;
+use cgmath::{Matrix4, Point3, Transform, Vector3, EuclideanSpace, SquareMatrix, InnerSpace};
 use gltf::image::Source;
 use image::{GenericImageView, ImageBuffer, Rgba};
 use std::path::{Path, PathBuf};
 use wgpu::*;
 use wgpu::util::DeviceExt;
-
-use cgmath::{Matrix4, SquareMatrix, Vector3};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -48,6 +47,9 @@ struct Primitive {
     index: Option<Buffer>,
     index_count: u32,
     material: usize,
+    // Local bounding sphere (AABB is only used during loading)
+    local_center: Vector3<f32>,
+    local_radius: f32,
 }
 
 struct RenderItem {
@@ -82,11 +84,11 @@ struct Vertex {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let ctx = init(args.width, args.height).await?;
+    let mut ctx = init(args.width, args.height).await?;
     let model = load_gltf(&ctx, &args.model).await?;
     let pipeline = create_pipeline(&ctx);
 
-    let pixels = render(&ctx, &model, &pipeline).await?;
+    let pixels = render(&mut ctx, &model, &pipeline).await?;
     save(&args.output, pixels, args.width, args.height)?;
 
     println!("Saved image to {}", args.output.display());
@@ -161,7 +163,7 @@ async fn init(width: u32, height: u32) -> Result<RenderContext> {
             visibility: ShaderStages::VERTEX,
             ty: BindingType::Buffer {
                 ty: BufferBindingType::Uniform,
-                has_dynamic_offset: true,
+                has_dynamic_offset: false,
                 min_binding_size: None,
             },
             count: None,
@@ -204,36 +206,32 @@ fn node_transform(node: &gltf::Node) -> cgmath::Matrix4<f32> {
     }
 }
 
-fn traverse_node(
-    node: gltf::Node,
-    parent_transform: Matrix4<f32>,
-    mesh_primitive_map: &[Vec<usize>],
-    render_items: &mut Vec<RenderItem>,
-) {
-    let local_transform = node_transform(&node);
-    let world_transform = parent_transform * local_transform;
-
-    if let Some(mesh) = node.mesh() {
-        if let Some(primitive_indices) = mesh_primitive_map.get(mesh.index()) {
-            for &prim_idx in primitive_indices {
-                render_items.push(RenderItem {
-                    primitive: prim_idx,
-                    transform: world_transform,
-                });
-            }
-        }
+fn transform_aabb(
+    aabb_min: Vector3<f32>,
+    aabb_max: Vector3<f32>,
+    transform: Matrix4<f32>,
+) -> (Vector3<f32>, Vector3<f32>) {
+    let corners = [
+        Vector3::new(aabb_min.x, aabb_min.y, aabb_min.z),
+        Vector3::new(aabb_max.x, aabb_min.y, aabb_min.z),
+        Vector3::new(aabb_min.x, aabb_max.y, aabb_min.z),
+        Vector3::new(aabb_max.x, aabb_max.y, aabb_min.z),
+        Vector3::new(aabb_min.x, aabb_min.y, aabb_max.z),
+        Vector3::new(aabb_max.x, aabb_min.y, aabb_max.z),
+        Vector3::new(aabb_min.x, aabb_max.y, aabb_max.z),
+        Vector3::new(aabb_max.x, aabb_max.y, aabb_max.z),
+    ];
+    let mut world_min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut world_max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for corner in corners {
+        let world_corner = transform.transform_point(Point3::from_vec(corner)).to_vec();
+        world_min = world_min.zip(world_corner, |a, b| a.min(b));
+        world_max = world_max.zip(world_corner, |a, b| a.max(b));
     }
-
-    for child in node.children() {
-        traverse_node(child, world_transform, mesh_primitive_map, render_items);
-    }
+    (world_min, world_max)
 }
 
 async fn load_gltf(ctx: &RenderContext, path: &Path) -> Result<Model> {
-    //use cgmath::{Matrix4, Vector3, Transform, Point3};
-    use cgmath::{Matrix4, Vector3, Transform, Point3, EuclideanSpace};
-    //use cgmath::{Matrix4, Vector3, Point3, EuclideanSpace, SquareMatrix};
-    
     let (doc, buffers, _) = gltf::import(path)?;
     let base = path.parent().context("Model has no parent directory")?;
 
@@ -255,7 +253,11 @@ async fn load_gltf(ctx: &RenderContext, path: &Path) -> Result<Model> {
     let default_tex = {
         let data = [255u8, 255, 255, 255];
         let tex = ctx.device.create_texture(&TextureDescriptor {
-            size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            size: Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
@@ -267,8 +269,16 @@ async fn load_gltf(ctx: &RenderContext, path: &Path) -> Result<Model> {
         ctx.queue.write_texture(
             tex.as_image_copy(),
             &data,
-            TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
-            Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
         );
         tex
     };
@@ -282,7 +292,8 @@ async fn load_gltf(ctx: &RenderContext, path: &Path) -> Result<Model> {
     // ---- Materials ----
     let mut materials = Vec::new();
     for mat in doc.materials() {
-        let tex = mat.pbr_metallic_roughness()
+        let tex = mat
+            .pbr_metallic_roughness()
             .base_color_texture()
             .map(|t| t.texture().index())
             .and_then(|i| textures.get(i).copied())
@@ -298,33 +309,77 @@ async fn load_gltf(ctx: &RenderContext, path: &Path) -> Result<Model> {
         });
         materials.push(Material { bind_group: bind });
     }
+    // Ensure at least one material
+    if materials.is_empty() {
+        let view = default_tex.create_view(&Default::default());
+        let bind = ctx.device.create_bind_group(&BindGroupDescriptor {
+            layout: &ctx.material_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&ctx.sampler) },
+            ],
+            label: Some("fallback_material"),
+        });
+        materials.push(Material { bind_group: bind });
+    }
 
-    // ---- Read all primitive data (CPU side) ----
+    // ---- Read all primitive data (CPU side) with local bounds ----
     struct CpuPrimitive {
         vertices: Vec<Vertex>,
         indices: Option<Vec<u32>>,
         material: usize,
+        local_min: Vector3<f32>,
+        local_max: Vector3<f32>,
+        local_center: Vector3<f32>,
+        local_radius: f32,
     }
     let mut cpu_primitives = Vec::new();
 
     for mesh in doc.meshes() {
         for prim in mesh.primitives() {
+
             let reader = prim.reader(|b| Some(&buffers[b.index()].0));
-            let positions: Vec<_> = reader.read_positions().context("No positions")?.collect();
+            let positions: Vec<_> = reader
+                .read_positions()
+                .context("No positions in mesh")?
+                .collect();
             let uvs: Vec<_> = reader
                 .read_tex_coords(0)
                 .map(|c| c.into_f32().collect())
                 .unwrap_or(vec![[0.0, 0.0]; positions.len()]);
+
             let vertices: Vec<Vertex> = positions
                 .into_iter()
                 .zip(uvs)
                 .map(|(p, uv)| Vertex { pos: p, uv })
                 .collect();
-            let indices = reader.read_indices().map(|indices| indices.into_u32().collect());
+
+            // Compute local AABB
+            let mut local_min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+            let mut local_max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for v in &vertices {
+                let p = Vector3::new(v.pos[0], v.pos[1], v.pos[2]);
+                local_min = local_min.zip(p, |a, b| a.min(b));
+                local_max = local_max.zip(p, |a, b| a.max(b));
+            }
+            let local_center = (local_min + local_max) / 2.0;
+            let local_radius = (local_max - local_min).magnitude() / 2.0;
+
+            let indices = reader
+                .read_indices()
+                .map(|indices| indices.into_u32().collect());
+
+            let raw_material_idx = prim.material().index().unwrap_or(0);
+            let material_idx = raw_material_idx.min(materials.len() - 1); // clamp
+
             cpu_primitives.push(CpuPrimitive {
                 vertices,
                 indices,
-                material: prim.material().index().unwrap_or(0),
+                material: material_idx,
+                local_min,
+                local_max,
+                local_center,
+                local_radius,
             });
         }
     }
@@ -341,17 +396,19 @@ async fn load_gltf(ctx: &RenderContext, path: &Path) -> Result<Model> {
         mesh_primitive_map.push(prim_indices);
     }
 
-    // ---- Traverse scene to build render_items and collect world positions for bounds ----
+    // ---- Traverse scene to build render_items and compute global bounds using AABB ----
     let mut render_items = Vec::new();
-    let mut world_positions = Vec::new();
+    let mut global_min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut global_max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
 
-    fn traverse_and_collect(
+    fn traverse(
         node: gltf::Node,
         parent_transform: Matrix4<f32>,
         mesh_primitive_map: &[Vec<usize>],
         cpu_primitives: &[CpuPrimitive],
         render_items: &mut Vec<RenderItem>,
-        world_positions: &mut Vec<Vector3<f32>>,
+        global_min: &mut Vector3<f32>,
+        global_max: &mut Vector3<f32>,
     ) {
         let local_transform = node_transform(&node);
         let world_transform = parent_transform * local_transform;
@@ -363,60 +420,52 @@ async fn load_gltf(ctx: &RenderContext, path: &Path) -> Result<Model> {
                         primitive: prim_idx,
                         transform: world_transform,
                     });
-                    // Add transformed vertices for bounds
+
                     let prim = &cpu_primitives[prim_idx];
-                    for vertex in &prim.vertices {
-                        let pos = Vector3::new(vertex.pos[0], vertex.pos[1], vertex.pos[2]);
-                        let world_pos = world_transform.transform_point(Point3::new(pos.x, pos.y, pos.z));
-                        world_positions.push(world_pos.to_vec());
-                    }
+                    let (world_min, world_max) =
+                        transform_aabb(prim.local_min, prim.local_max, world_transform);
+                    *global_min = global_min.zip(world_min, |a, b| a.min(b));
+                    *global_max = global_max.zip(world_max, |a, b| a.max(b));
                 }
             }
         }
 
         for child in node.children() {
-            traverse_and_collect(
+            traverse(
                 child,
                 world_transform,
                 mesh_primitive_map,
                 cpu_primitives,
                 render_items,
-                world_positions,
+                global_min,
+                global_max,
             );
         }
     }
 
-    let scene = doc.default_scene().unwrap_or_else(|| doc.scenes().next().unwrap());
+    let scene = doc
+        .default_scene()
+        .unwrap_or_else(|| doc.scenes().next().unwrap());
     for node in scene.nodes() {
-        traverse_and_collect(
+        traverse(
             node,
             Matrix4::identity(),
             &mesh_primitive_map,
             &cpu_primitives,
             &mut render_items,
-            &mut world_positions,
+            &mut global_min,
+            &mut global_max,
         );
     }
 
-    // ---- Compute bounding box ----
-    let mut bounds_min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
-    let mut bounds_max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for pos in &world_positions {
-        bounds_min.x = bounds_min.x.min(pos.x);
-        bounds_min.y = bounds_min.y.min(pos.y);
-        bounds_min.z = bounds_min.z.min(pos.z);
-        bounds_max.x = bounds_max.x.max(pos.x);
-        bounds_max.y = bounds_max.y.max(pos.y);
-        bounds_max.z = bounds_max.z.max(pos.z);
-    }
-    if world_positions.is_empty() {
-        bounds_min = Vector3::new(-1.0, -1.0, -1.0);
-        bounds_max = Vector3::new(1.0, 1.0, 1.0);
+    if render_items.is_empty() {
+        global_min = Vector3::new(-1.0, -1.0, -1.0);
+        global_max = Vector3::new(1.0, 1.0, 1.0);
     }
 
-    println!("Bounds min: {:?}, max: {:?}", bounds_min, bounds_max);
-    println!("Center: {:?}", (bounds_min + bounds_max) / 2.0);
-    println!("Size: {:?}", bounds_max - bounds_min);
+    println!("Bounds min: {:?}, max: {:?}", global_min, global_max);
+    println!("Center: {:?}", (global_min + global_max) / 2.0);
+    println!("Size: {:?}", global_max - global_min);
 
     // ---- Upload primitives to GPU ----
     let mut primitives = Vec::new();
@@ -441,6 +490,8 @@ async fn load_gltf(ctx: &RenderContext, path: &Path) -> Result<Model> {
             index,
             index_count: count,
             material: cpu_prim.material,
+            local_center: cpu_prim.local_center,
+            local_radius: cpu_prim.local_radius,
         });
     }
 
@@ -448,8 +499,8 @@ async fn load_gltf(ctx: &RenderContext, path: &Path) -> Result<Model> {
         primitives,
         materials,
         render_items,
-        bounds_min,
-        bounds_max,
+        bounds_min: global_min,
+        bounds_max: global_max,
     })
 }
 
@@ -491,7 +542,9 @@ fn upload_texture(ctx: &RenderContext, img: &image::DynamicImage) -> Texture {
 }
 
 fn create_pipeline(ctx: &RenderContext) -> RenderPipeline {
-    let shader = ctx.device.create_shader_module(include_wgsl!("shader.wgsl"));
+    let shader = ctx
+        .device
+        .create_shader_module(include_wgsl!("shader.wgsl"));
 
     let layout = ctx.device.create_pipeline_layout(&PipelineLayoutDescriptor {
         bind_group_layouts: &[&ctx.camera_layout, &ctx.material_layout, &ctx.object_layout],
@@ -547,30 +600,50 @@ fn create_pipeline(ctx: &RenderContext) -> RenderPipeline {
     })
 }
 
-async fn render(ctx: &RenderContext, model: &Model, pipeline: &RenderPipeline) -> Result<Vec<u8>> {
+fn sphere_in_frustum_view(
+    center_view: Vector3<f32>,   // in view space (camera looks toward -Z)
+    radius: f32,
+    fov_y_rad: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+) -> bool {
+    // Distance from camera plane (positive because points in front have negative Z)
+    let z_dist = -center_view.z;
+    if z_dist + radius < near { return false; }
+    if z_dist - radius > far { return false; }
+
+    let tan_half_fov = (fov_y_rad / 2.0).tan();
+    let half_height = z_dist * tan_half_fov;
+    let half_width = half_height * aspect;
+
+    if center_view.x.abs() - radius > half_width { return false; }
+    if center_view.y.abs() - radius > half_height { return false; }
+
+    true
+}
+
+async fn render(ctx: &mut RenderContext, model: &Model, pipeline: &RenderPipeline) -> Result<Vec<u8>> {
     use cgmath::*;
-    
-        // Auto-frame camera based on model bounds
+
+    // Auto-frame camera based on model bounds
     let center = (model.bounds_min + model.bounds_max) / 2.0;
     let size = model.bounds_max - model.bounds_min;
-    let radius = size.magnitude() / 2.0; // half diagonal
+    let radius = size.magnitude() / 2.0;
 
-    // Compute distance needed for vertical FOV
     let fov_rad = 45.0_f32.to_radians();
     let distance_vertical = radius / (fov_rad / 2.0).tan();
-
-    // Also consider horizontal FOV based on aspect ratio
     let aspect = ctx.width as f32 / ctx.height as f32;
     let horizontal_fov = 2.0 * (aspect * (fov_rad / 2.0).tan()).atan();
     let distance_horizontal = radius / (horizontal_fov / 2.0).tan();
+    let distance = distance_vertical.max(distance_horizontal) * 1.2;
 
-    // Take the larger distance to ensure both axes fit
-    let distance = distance_vertical.max(distance_horizontal) * 1.2; // 20% margin
-
-    // Place camera at a direction that gives a good view (from +X, +Y, +Z)
     let direction = Vector3::new(1.0, 1.0, 1.0).normalize();
     let eye = center + direction * distance;
     let target = center;
+
+    println!("Model bounds: min {:?}, max {:?}", model.bounds_min, model.bounds_max);
+    println!("Camera eye: {:?}, target: {:?}, distance: {}", eye, target, distance);
 
     let cam = Matrix4::look_at_rh(Point3::from_vec(eye), Point3::from_vec(target), Vector3::unit_y());
     let proj = perspective(Deg(45.0), aspect, 0.01, distance * 3.0);
@@ -584,42 +657,33 @@ async fn render(ctx: &RenderContext, model: &Model, pipeline: &RenderPipeline) -
         }]),
     );
 
-    // Prepare transforms for all render items
-    let mut transforms = Vec::new();
+    // Extract frustum planes for culling
+
+
+    // Create a separate uniform buffer for each primitive
+    let mut primitive_buffers = Vec::new();
+    let mut primitive_bind_groups = Vec::new();
+
     for item in &model.render_items {
-        transforms.push(ObjectUniform {
+        let uniform = ObjectUniform {
             model: item.transform.into(),
+        };
+        let buffer = ctx.device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("primitive_uniform_buffer"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: BufferUsages::UNIFORM,
         });
+        let bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
+            layout: &ctx.object_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+            label: Some("primitive_bind_group"),
+        });
+        primitive_buffers.push(buffer);
+        primitive_bind_groups.push(bind_group);
     }
-
-    // Create a single buffer large enough for all transforms
-    let transform_size = std::mem::size_of::<ObjectUniform>() as u64;
-    let total_size = transform_size * transforms.len() as u64;
-    let transform_buffer = ctx.device.create_buffer(&BufferDescriptor {
-        label: Some("transform_buffer"),
-        size: total_size,
-        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    // Write all transforms
-    if !transforms.is_empty() {
-        ctx.queue.write_buffer(&transform_buffer, 0, bytemuck::cast_slice(&transforms));
-    }
-
-    // Create one bind group that references the whole buffer
-    let object_bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
-        layout: &ctx.object_layout,
-        entries: &[BindGroupEntry {
-            binding: 0,
-            resource: BindingResource::Buffer(BufferBinding {
-                buffer: &transform_buffer,
-                offset: 0,
-                size: None,
-            }),
-        }],
-        label: Some("object_bind_group"),
-    });
 
     // Create output texture
     let tex = ctx.device.create_texture(&TextureDescriptor {
@@ -667,12 +731,37 @@ async fn render(ctx: &RenderContext, model: &Model, pipeline: &RenderPipeline) -
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &ctx.camera_bind_group, &[]);
 
-        // Draw each primitive with its transform
+
+        let near = 0.01;
+        let far = distance * 3.0;
+
+
+        // Draw each primitive with frustum culling
+        let mut drawn_count = 0;
+
         for (i, item) in model.render_items.iter().enumerate() {
             let prim = &model.primitives[item.primitive];
-            let dynamic_offset = (i * transform_size as usize) as u32;
 
-            pass.set_bind_group(2, &object_bind_group, &[dynamic_offset]);
+            // Transform bounding sphere to world space
+            let world_center = item.transform.
+            transform_point(Point3::from_vec(prim.local_center)).to_vec();
+            
+            // Compute world radius by transforming a local offset vector
+            let local_offset = Vector3::new(prim.local_radius, 0.0, 0.0);
+            let world_offset = item.transform.transform_vector(local_offset);
+            let world_radius = world_offset.magnitude();
+            
+            println!("Prim {}: center {:?}, radius {}, world_radius {}", i, world_center, prim.local_radius, world_radius);
+
+            // Transform to view space
+            let center_view = cam.transform_point(Point3::from_vec(world_center)).to_vec();
+
+            if !sphere_in_frustum_view(center_view, world_radius, fov_rad, aspect, near, far) {
+                continue; // Cull this primitive
+           }
+
+            
+            pass.set_bind_group(2, &primitive_bind_groups[i], &[]);
             pass.set_bind_group(1, &model.materials[prim.material].bind_group, &[]);
             pass.set_vertex_buffer(0, prim.vertex.slice(..));
 
@@ -682,7 +771,9 @@ async fn render(ctx: &RenderContext, model: &Model, pipeline: &RenderPipeline) -
             } else {
                 pass.draw(0..prim.index_count, 0..1);
             }
+            drawn_count += 1;
         }
+        println!("Drawn primitives: {} / {}", drawn_count, model.render_items.len());
     }
 
     // Read back pixels
@@ -722,7 +813,6 @@ async fn render(ctx: &RenderContext, model: &Model, pipeline: &RenderPipeline) -
     let data = slice.get_mapped_range();
 
     let mut pixels = Vec::with_capacity((ctx.width * ctx.height * 4) as usize);
-
     let padded = align_to(4 * ctx.width, 256) as usize;
     let row_size = (4 * ctx.width) as usize;
 
